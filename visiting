@@ -2,14 +2,15 @@
 # -*- mode: ruby -*-
 require 'json'
 require 'open3'
+require 'curb'
 require 'ruby-debug'
 require 'hipe-core/interfacey'
 require 'hipe-core/struct/table'
 
 module Hipe
   class Visiting
-    class ApplicationRuntimeError < RuntimeError; end
-    class DataFileException < ApplicationRuntimeError; end
+    class Fail < RuntimeError; end
+    class DataFileException < Fail; end
     include Interfacey::Service
     interface.might do
       speaks :cli
@@ -59,13 +60,17 @@ module Hipe
 
       responds_to "help", "page << self", :aliases=>['-h','--help','-h']
       default_request "help"
+      responds_to("pull", "pull file trees from sources") do
+        opts.on('-h',"this screen", &help)
+        opts.on('-l','--list','just list the available sources')
+        optional("name", "the name of the source tree in your data file")
+      end
       responds_to "list", "show list of visiting files"
       responds_to "diff", "show a diff from target to source of all files"
       responds_to("copy", "copy files over -- no undo!") do
         opts.on('-d','--dry', 'as dry run')
         opts.on('-f','--fast','no safey-catch sleeping thing')
       end
-      responds_to("pull", "coming one day..")
     end
 
     def initialize
@@ -153,10 +158,14 @@ module Hipe
       end
     end
 
-
-
     def struct
       @struct ||= begin
+        if !File.exist?(@path)
+          raise DataFileException.new(
+            "Please make a \"#{@path}\" file.  Please see "<<
+            "\"visiting.example.json\" next to this file."
+          )
+        end
         pre_struct = JSON.parse(File.read(@path))
         begin
           result = Json.unmarshal pre_struct, @path
@@ -274,7 +283,7 @@ module Hipe
           sleep(0.67) unless opts.fast
         end
         'done.'
-      rescue ApplicationRuntimeError => e
+      rescue Fail => e
         return Interfacey::ResponseLite.new(:error=>e.message)
       end
     end
@@ -298,7 +307,158 @@ module Hipe
         )
       end
     end
+
+    def sources
+      sources = {}
+      struct.sources.each do |item|
+        sources[item['name']] = item
+      end
+      sources
+    end
+
+    # Pathname fail
+    def split_from_extension basename
+      re = %r|([^\.]+)((?:\.(?:[^\.]+))*)$|
+      md = re.match(basename)
+      raise Fail.new('re fail '+basename) unless md
+      base = md[1]
+      ext = md[2]
+      [base,ext]
+    end
+
+    def file_basename_for_url url
+      base, ext = split_from_extension(File.basename(url))
+      base + ext
+    end
+
+    def fileize str
+      str.gsub(/[^a-z0-9]/i, '-')
+    end
+
+    def temp_path_for_url_file! url
+      bn = File.basename(url)
+      basename = file_basename_for_url url
+      File.join(temp_directory!,basename)
+    end
+
+    def temp_directory!
+      tmp_dir = './tmp.visiting-downloads'
+      FileUtils.mkdir(tmp_dir) unless File.exist? tmp_dir
+      tmp_dir
+    end
+
+    def move_to_backup! target_dir
+      # .bak is added twice so use can glob more easily it either way,
+      # either by folder name or by all backsup (@todo keep?)
+      new_name = target_dir +'.bak.'+
+        DateTime.now.strftime("%Y-%m-%d--%H-%I-%S")+'.bak'
+      FileUtils.mv(target_dir, new_name)
+      nil
+    end
+
+    def curl_it source, tempfile
+      c = Curl::Easy.new
+      c.url = source.url
+      puts "curling #{source.url}..."
+      c.perform
+      File.open(tempfile,'w') do |fh|
+        fh.write c.body_str
+      end
+      puts "wrote #{tempfile}"
+      nil
+    end
+
+    def unzip_it tempfile, target_dir
+      target_tarball = File.join(target_dir, File.basename(tempfile))
+      target_tarball = File.expand_path target_tarball
+      FileUtils.mkdir_p(File.dirname(target_tarball))
+      FileUtils.copy(tempfile, target_tarball)
+      exec = "cd #{target_dir}; tar -xzvf #{target_tarball}"
+      Open3.popen3(exec) do |sin, sout, serr|
+        # out = sout.read.strip  returns empty string & writes to stderr
+        err = serr.read.strip
+        puts err
+        # raise Fail.new("Popen3 error?: "+err.inspect) unless ""==err
+      end
+    end
+
+    def prune_it target_dir
+      files = Dir[target_dir+'/*']
+      unless (files.size==2 &&
+         /\.tar.gz$/.match(files.last) &&
+         File.directory?(files.first)
+      )
+        raise Fail.new("Can't prune directory with this signature: "<<
+          files.join(', ')
+        )
+      end
+      dirdir = files.first
+      moveme = Dir[dirdir+'/*']
+      moveme.each do |path|
+        puts "move #{path} to #{target_dir}"
+        FileUtils.mv(path, target_dir+'/')
+      end
+      remaining_files = Dir[dirdir+'/*']
+      if (remaining_files)
+        FileUtils.rmdir(dirdir)
+      else
+        puts "WARNING: why is directory not empty? "<<dirdir
+      end
+      puts "done."
+      nil
+    end
+
+    def for_now_only_tar_gz url
+      a,b = split_from_extension File.basename(url)
+      if ('.tar.gz'!=b)
+        raise DataFileException.new("for now, only .tar.gz extension, not "+b)
+      end
+    end
+
+    def pull_source source
+      # do file stuff before curl stuff
+      # for_now_only_tar_gz source.url
+      # bn = file_basename_for_url source.url
+      target_dir = File.join(source.target)
+      move_to_backup!(target_dir) if (File.exist?(target_dir))
+      tempfile = temp_path_for_url_file! source.url
+      # # end file stuff
+      # curl_it source, tempfile
+      unzip_it tempfile, target_dir
+      prune_it target_dir if source["prune"]
+      ''
+    end
+
+    def sources_list
+      sources.map{|pair| %{"#{pair[0]}"} }
+    end
+
+    def these_are_the_sources_i_know
+      "The sources I know about are: " << (sources_list * ', ' ) << '.'
+    end
+
+    def pull(name, opts)
+      sources = self.sources
+      if opts.list
+        puts these_are_the_sources_i_know; return ''
+      end
+      unless sources[name]
+         puts "I haven't heard of a source called \"#{name}.\"  "<<
+           these_are_the_sources_i_know
+         return ''
+      end
+      source = sources[name];
+      pull_source source
+    end
+
+    def my_cli_run(argv)
+      begin
+        return cli_run argv
+      rescue DataFileException => e
+        puts e.message
+      end
+    end
   end
 end
 
-puts Hipe::Visiting.new.cli_run(ARGV).to_s if $PROGRAM_NAME == __FILE__
+puts Hipe::Visiting.new.my_cli_run(ARGV).to_s if $PROGRAM_NAME == __FILE__
